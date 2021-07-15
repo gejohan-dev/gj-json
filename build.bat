@@ -1,7 +1,7 @@
 @echo off
 
-rem set DEFINES=/DGJ_DEBUG
-set COMPILE_FLAGS=/nologo /FC /Z7 /FA /Ox
+set DEFINES=/DGJ_DEBUG
+set COMPILE_FLAGS=/nologo /FC /Z7 /FA /Od
 set INCLUDES=/I..\gj
 set LINKER_FLAGS=/incremental:no /opt:icf /opt:ref
 

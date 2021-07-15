@@ -72,10 +72,11 @@ typedef enum JSONStateType
 typedef enum JSONObjectState
 {
     JSONObjectState_Start     = 0,
-    JSONObjectState_Key       = 1,
-    JSONObjectState_Colon     = 2,
-    JSONObjectState_Value     = 3,
-    JSONObjectState_CheckNext = 4
+    JSONObjectState_End       = 1,
+    JSONObjectState_Key       = 2,
+    JSONObjectState_Colon     = 3,
+    JSONObjectState_Value     = 4,
+    JSONObjectState_CheckNext = 5
 } JSONObjectState;
 
 typedef enum JSONArrayState
@@ -92,10 +93,26 @@ typedef enum JSONStringState
     JSONStringState_Backslash = 2
 } JSONStringState;
 
+typedef enum JSONNumberState
+{
+    JSONNumberState_IntegerSign = 0,
+    JSONNumberState_Integer   = 1,
+    JSONNumberState_Fraction  = 2,
+    JSONNumberState_FractionInteger = 3,
+    JSONNumberState_Exponent,
+    JSONNumberState_ExponentSign,
+    JSONNumberState_ExponentInteger,
+} JSONNumberState;
+
 typedef struct JSONParseState
 {
+#if GJ_DEBUG
     JSONStateType type;
-    int n;
+    JSONObjectState state;
+#else
+    char type;
+    char state;
+#endif
 } JSONParseState;
 
 #define JSON_PARSE_QUEUE_SIZE 100
@@ -107,24 +124,23 @@ typedef struct JSONParseQueue
 
 static JSONParseQueue json_parse_queue;
 
-static void json_parse_queue_push(JSONStateType type, int n)
+static void json_parse_queue_push(JSONStateType type)
 {
-    Assert(json_parse_queue.count <= JSON_PARSE_QUEUE_SIZE);
+    gj_Assert(json_parse_queue.count <= JSON_PARSE_QUEUE_SIZE);
     gj_ZeroMemory(&json_parse_queue.queue[json_parse_queue.count]);
-    json_parse_queue.queue[json_parse_queue.count].type = type;
-    json_parse_queue.queue[json_parse_queue.count].n    = n;
+    json_parse_queue.queue[json_parse_queue.count].type  = type;
     json_parse_queue.count++;
 }
 
 static void json_parse_queue_pop()
 {
-    Assert(json_parse_queue.count > 0);
+    gj_Assert(json_parse_queue.count > 0);
     json_parse_queue.count--;
 }
 
 static JSONParseState* json_parse_queue_current()
 {
-    Assert(json_parse_queue.count > 0);
+    gj_Assert(json_parse_queue.count > 0);
     return &json_parse_queue.queue[json_parse_queue.count - 1];
 }
 
@@ -134,12 +150,11 @@ static JSONParseState* json_parse_queue_current()
 typedef struct JSONParseData
 {
     // TODO: Unicode
-    char*  data;
-    size_t size;
-    size_t data_cursor;
-    
-    JSON json;
+    char*        data;
+    size_t       size;
+    unsigned int cursor;
 } JSONParseData;
+
 
 static void gjson_parse_value (JSONParseData* json_parse_data);
 static void gjson_parse_object(JSONParseData* json_parse_data);
@@ -147,99 +162,154 @@ static void gjson_parse_array (JSONParseData* json_parse_data);
 static void gjson_parse_string(JSONParseData* json_parse_data);
 static void gjson_parse_number(JSONParseData* json_parse_data);
 
-static inline int gjson_out_of_bytes(JSONParseData* json_parse_data) { return json_parse_data->data_cursor >= json_parse_data->size; }
+static inline int gjson_out_of_bytes(JSONParseData* json_parse_data) { return json_parse_data->cursor >= json_parse_data->size; }
+#define ReturnIfOutOfBytes()       if (gjson_out_of_bytes(json_parse_data)) return 0;
 
 static inline char gjson_feed_current_char(JSONParseData* json_parse_data)
 {
-    Assert(json_parse_data->data_cursor < json_parse_data->size);
-    return json_parse_data->data[json_parse_data->data_cursor++];
+    gj_Assert(json_parse_data->cursor < json_parse_data->size);
+    return json_parse_data->data[json_parse_data->cursor++];
 }
 
 static inline char gjson_peek_current_char(JSONParseData* json_parse_data)
 {
-    Assert(json_parse_data->data_cursor < json_parse_data->size);
-    return json_parse_data->data[json_parse_data->data_cursor];
+    gj_Assert(json_parse_data->cursor < json_parse_data->size);
+    return json_parse_data->data[json_parse_data->cursor];
 }
 
 static inline char* gjson_get_current_cursor(JSONParseData* json_parse_data)
 {
-    Assert(json_parse_data->data_cursor < json_parse_data->size);
-    return &json_parse_data->data[json_parse_data->data_cursor];
+    gj_Assert(json_parse_data->cursor < json_parse_data->size);
+    return &json_parse_data->data[json_parse_data->cursor];
 }
 
-static inline void gjson_move_cursor(JSONParseData* json_parse_data, size_t n)
+static inline int gjson_skip_whitespace(JSONParseData* json_parse_data)
 {
+    ReturnValIfOutOfBytes(0);
+    
+    while (gj_IsWhitespace(gjson_peek_current_char(json_parse_data)))
+    {
+        gjson_feed_current_char(json_parse_data);
+        if (gjson_out_of_bytes(json_parse_data))
+        {
+            return 0;
+        }
+    }
     json_parse_queue_pop();
-    if (json_parse_data->size - json_parse_data->data_cursor < n)
-    {
-        json_parse_data->data_cursor = json_parse_data->size;
-        json_parse_queue_push(JSONStateType_MoveCursor,
-                              n - (json_parse_data->size - json_parse_data->data_cursor));
-    }
-    else
-    {
-        json_parse_data->data_cursor += n;
-    }
-}
-
-static inline void gjson_skip_whitespace(JSONParseData* json_parse_data)
-{
-    if (gj_IsWhitespace(gjson_peek_current_char(json_parse_data)))
-    {
-        json_parse_queue_push(JSONStateType_MoveCursor, 1);
-    }
-    else
-    {
-        json_parse_queue_pop();
-    }
+    return 1;
 }
 
 static void gjson_parse_object(JSONParseData* json_parse_data)
 {
     JSONParseState* current = json_parse_queue_current();
-    if (current->n == JSONObjectState_Start)
+    while (1)
     {
-        Assert(gjson_feed_current_char(json_parse_data) == GJSON_OBJECT_START);
-        current->n = JSONObjectState_Key;
-    }
-    else if (current->n == JSONObjectState_Key)
-    {
-        if (gjson_peek_current_char(json_parse_data) == GJSON_OBJECT_END)
+        if (current->state == JSONObjectState_Start)
         {
-            gjson_move_cursor(json_parse_data, 1);
-            json_parse_queue_pop();
-            return;
+            gj_Assert(gjson_peek_current_char(json_parse_data) == GJSON_OBJECT_START);
+            gjson_feed_current_char(json_parse_data);
+
+            current->state = JSONObjectState_End;
+
+            if (!gjson_skip_whitespace(json_parse_data))
+            {
+                json_parse_queue_push(JSONStateType_SkipWhitespace);
+                return;
+            }
         }
 
-        json_parse_queue_push(JSONStateType_SkipWhitespace, 0);
-        json_parse_queue_push(JSONStateType_String,         0);
-        json_parse_queue_push(JSONStateType_SkipWhitespace, 0);
-        current->n = JSONObjectState_Colon;
-    }
-    else if (current->n == JSONObjectState_Colon)
-    {
-        Assert(gjson_feed_current_char(json_parse_data) == GJSON_MEMBER_COLON);
-        current->n = JSONObjectState_Value;
-    }
-    else if (current->n == JSONObjectState_Value)
-    {
-        json_parse_queue_push(JSONStateType_SkipWhitespace, 0);
-        json_parse_queue_push(JSONStateType_Value,          0);
-        json_parse_queue_push(JSONStateType_SkipWhitespace, 0);
-        current->n = JSONObjectState_CheckNext;
-    }
-    else if (current->n == JSONObjectState_CheckNext)
-    {
-        if (gjson_peek_current_char(json_parse_data) == GJSON_ELEMENT_SEPARATOR)
+        if (current->state == JSONObjectState_End)
         {
-            Assert(gjson_feed_current_char(json_parse_data) == GJSON_ELEMENT_SEPARATOR);
-            json_parse_queue_push(JSONStateType_SkipWhitespace, 0);
-            current->n = JSONObjectState_Key;
+            if (gjson_peek_current_char(json_parse_data) == GJSON_OBJECT_END)
+            {
+                gjson_feed_current_char(json_parse_data);
+                json_parse_queue_pop();
+                return;
+            }
+            else
+            {
+                current->state = JSONObjectState_Key;
+            }
         }
-        else
+        
+        if (current->state == JSONObjectState_Key)
         {
-            Assert(gjson_feed_current_char(json_parse_data) == GJSON_OBJECT_END);
-            json_parse_queue_pop();
+            ReturnIfOutOfBytes();
+
+#define KeyPush()                                                       \
+            do {                                                        \
+                json_parse_queue_push(JSONStateType_SkipWhitespace);    \
+                json_parse_queue_push(JSONStateType_String);            \
+                json_parse_queue_push(JSONStateType_SkipWhitespace);    \
+            } while (0)
+            
+            if (gjson_skip_whitespace(json_parse_data))
+            {
+                if (gjson_parse_string(json_parse_data))
+                {
+                    if (!gjson_skip_whitespace(json_parse_data)) KeyPush();
+                }
+                else KeyPush();
+            }
+            else KeyPush();
+#undef KeyPush            
+            current->state = JSONObjectState_Colon;
+        }
+        
+        if (current->state == JSONObjectState_Colon)
+        {
+            ReturnIfOutOfBytes();
+        
+            gj_Assert(gjson_peek_current_char(json_parse_data) == GJSON_MEMBER_COLON);
+            gjson_feed_current_char(json_parse_data);
+            current->state = JSONObjectState_Value;
+        }
+
+        if (current->state == JSONObjectState_Value)
+        {
+            ReturnIfOutOfBytes();
+            
+#define ValuePush()                                                     \
+            do {                                                        \
+                json_parse_queue_push(JSONStateType_SkipWhitespace);    \
+                json_parse_queue_push(JSONStateType_Value);             \
+                json_parse_queue_push(JSONStateType_SkipWhitespace);    \
+            } while (0)
+            
+            if (gjson_skip_whitespace(json_parse_data))
+            {
+                if (gjson_parse_value(json_parse_data))
+                {
+                    if (!gjson_skip_whitespace(json_parse_data)) ValuePush();
+                }
+                else ValuePush();
+            }
+            else ValuePush();
+            
+            current->state = JSONObjectState_Colon;
+        }
+#undef KeyPush
+            current->state = JSONObjectState_CheckNext;
+        }
+
+        if (current->state == JSONObjectState_CheckNext)
+        {
+            ReturnIfOutOfBytes();
+        
+            if (gjson_peek_current_char(json_parse_data) == GJSON_ELEMENT_SEPARATOR)
+            {
+                gjson_feed_current_char(json_parse_data);
+                json_parse_queue_push(JSONStateType_SkipWhitespace);
+                gjson_skip_whitespace(json_parse_data);
+                current->state = JSONObjectState_Key;
+            }
+            else
+            {
+                gj_Assert(gjson_peek_current_char(json_parse_data) == GJSON_OBJECT_END);
+                gjson_feed_current_char(json_parse_data);
+                json_parse_queue_pop();
+                return;
+            }
         }
     }
 }
@@ -247,36 +317,55 @@ static void gjson_parse_object(JSONParseData* json_parse_data)
 static void gjson_parse_array(JSONParseData* json_parse_data)
 {
     JSONParseState* current = json_parse_queue_current();
-    if (current->n == JSONArrayState_Start)
+    while (1)
     {
-        Assert(gjson_feed_current_char(json_parse_data) == GJSON_ARRAY_START);
-        current->n = JSONArrayState_Value;
-    }
-    else if (current->n == JSONArrayState_Value)
-    {
-        if (gjson_peek_current_char(json_parse_data) == GJSON_ARRAY_END)
+        if (current->state == JSONArrayState_Start)
         {
-            Assert(gjson_feed_current_char(json_parse_data) == GJSON_ARRAY_END);
-            json_parse_queue_pop();
-            return;
+            gj_Assert(gjson_peek_current_char(json_parse_data) == GJSON_ARRAY_START);
+            gjson_feed_current_char(json_parse_data);
+            current->state = JSONArrayState_Value;
         }
 
-        json_parse_queue_push(JSONStateType_SkipWhitespace, 0);
-        json_parse_queue_push(JSONStateType_Value,          0);
-        json_parse_queue_push(JSONStateType_SkipWhitespace, 0);
-        current->n = JSONArrayState_CheckNext;
-    }
-    else if (current->n == JSONArrayState_CheckNext)
-    {
-        if (gjson_peek_current_char(json_parse_data) == GJSON_ELEMENT_SEPARATOR)
+        if (current->state == JSONArrayState_Value)
         {
-            Assert(gjson_feed_current_char(json_parse_data) == GJSON_ELEMENT_SEPARATOR);
-            current->n = JSONArrayState_Value;
+            ReturnIfOutOfBytes();
+        
+            if (gjson_peek_current_char(json_parse_data) == GJSON_ARRAY_END)
+            {
+                gj_Assert(gjson_peek_current_char(json_parse_data) == GJSON_ARRAY_END);
+                gjson_feed_current_char(json_parse_data);
+                json_parse_queue_pop();
+                return;
+            }
+            else
+            {
+                json_parse_queue_push(JSONStateType_SkipWhitespace);
+                gjson_skip_whitespace(json_parse_data);
+                json_parse_queue_push(JSONStateType_Value);
+                gjson_parse_value(json_parse_data);
+                json_parse_queue_push(JSONStateType_SkipWhitespace);
+                gjson_skip_whitespace(json_parse_data);
+                current->state = JSONArrayState_CheckNext;
+            }
         }
-        else
+
+        if (current->state == JSONArrayState_CheckNext)
         {
-            Assert(gjson_feed_current_char(json_parse_data) == GJSON_ARRAY_END);
-            json_parse_queue_pop();
+            ReturnIfOutOfBytes();
+        
+            if (gjson_peek_current_char(json_parse_data) == GJSON_ELEMENT_SEPARATOR)
+            {
+                gj_Assert(gjson_peek_current_char(json_parse_data) == GJSON_ELEMENT_SEPARATOR);
+                gjson_feed_current_char(json_parse_data);
+                current->state = JSONArrayState_Value;
+            }
+            else
+            {
+                gj_Assert(gjson_peek_current_char(json_parse_data) == GJSON_ARRAY_END);
+                gjson_feed_current_char(json_parse_data);
+                json_parse_queue_pop();
+                return;
+            }
         }
     }
 }
@@ -284,113 +373,191 @@ static void gjson_parse_array(JSONParseData* json_parse_data)
 static void gjson_parse_string(JSONParseData* json_parse_data)
 {
     JSONParseState* current = json_parse_queue_current();
-    if (current->n == JSONStringState_Start)
+    if (current->state == JSONStringState_Start)
     {
-        Assert(gjson_feed_current_char(json_parse_data) == GJSON_STRING);
-        current->n = JSONStringState_Char;
+        gj_Assert(gjson_peek_current_char(json_parse_data) == GJSON_STRING);
+        gjson_feed_current_char(json_parse_data);
+        current->state = JSONStringState_Char;
     }
-    else if (current->n == JSONStringState_Char)
+
+    while (1)
     {
-        char current_char = gjson_feed_current_char(json_parse_data);
-        if (current_char == GJSON_STRING)
+        /* ReturnIfOutOfBytes(); */
+        if (gjson_out_of_bytes(json_parse_data))
         {
-            json_parse_queue_pop();
             return;
         }
-        else if (current_char == '\\')
-        {
-            current->n = JSONStringState_Backslash;
+        
+        if (current->state == JSONStringState_Char)
+        {        
+            while (1)
+            {
+                /* ReturnIfOutOfBytes(); */
+                if (gjson_out_of_bytes(json_parse_data))
+                {
+                    return;
+                }
+                
+                char current_char = gjson_feed_current_char(json_parse_data);
+                if (current_char == GJSON_STRING)
+                {
+                    json_parse_queue_pop();
+                    return;
+                }
+                else if (current_char == '\\')
+                {
+                    current->state = JSONStringState_Backslash;
+                    break;
+                }
+        
+            }
         }
-    }
-    else if (current->n == JSONStringState_Backslash)
-    {
-        char current_char = gjson_feed_current_char(json_parse_data);
-        current->n = JSONStringState_Char;
-        /* if (current_char == '\\' || current_char == '"') */
-        /* { */
-        /* current->n = JSONStringState_Char; */
-        /* } */
-        /* else InvalidCodePath; */
+
+        if (current->state == JSONStringState_Backslash)
+        {
+            ReturnIfOutOfBytes();
+            
+            char current_char = gjson_feed_current_char(json_parse_data);
+            current->state = JSONStringState_Char;
+        }
     }
 }
 
 static void gjson_parse_number(JSONParseData* json_parse_data)
 {
-    // Note: Implicit integer
+    JSONParseState* current = json_parse_queue_current();
+    
+    if (current->state == JSONNumberState_IntegerSign)
     {
         if (gjson_peek_current_char(json_parse_data) == GJSON_SIGN_NEGATIVE)
         {
             // TODO
-            gjson_move_cursor(json_parse_data, 1);
+            gjson_feed_current_char(json_parse_data);
         }
-        int integer_length;
-        int integer = gj_parse_number(gjson_get_current_cursor(json_parse_data), &integer_length);
-        gjson_move_cursor(json_parse_data, integer_length);
-    }
-    
-    // Note: Implicit fraction
-    if (gjson_peek_current_char(json_parse_data) == GJSON_FRACTION)
-    {
-        gjson_move_cursor(json_parse_data, 1);
-        int integer_length;
-        int integer = gj_parse_number(gjson_get_current_cursor(json_parse_data), &integer_length);
-        gjson_move_cursor(json_parse_data, integer_length);
+        current->state = JSONNumberState_Integer;
     }
 
-    // Note: Implicit exponent
-    if (gjson_peek_current_char(json_parse_data) == GJSON_EXPONENT_E ||
-        gjson_peek_current_char(json_parse_data) == GJSON_EXPONENT_e)
+    if (current->state == JSONNumberState_Integer)
     {
-        gjson_move_cursor(json_parse_data, 1);
-
-        // Note: Implicit sign
-        if (gjson_peek_current_char(json_parse_data) == GJSON_SIGN_POSITIVE ||
-            gjson_peek_current_char(json_parse_data) == GJSON_SIGN_NEGATIVE)
+        while (gj_IsDigit(gjson_peek_current_char(json_parse_data)))
         {
             // TODO
-            gjson_move_cursor(json_parse_data, 1);            
+            gjson_feed_current_char(json_parse_data);
+            ReturnIfOutOfBytes();
         }
+        current->state = JSONNumberState_Fraction;
+    }
 
-        // Note: Implicit digits
-        int integer_length;
-        int integer = gj_parse_number(gjson_get_current_cursor(json_parse_data), &integer_length);
-        gjson_move_cursor(json_parse_data, integer_length);
+    if (current->state == JSONNumberState_Fraction)
+    {
+        if (gjson_peek_current_char(json_parse_data) == GJSON_FRACTION)
+        {
+            // TODO
+            gjson_feed_current_char(json_parse_data);
+            current->state = JSONNumberState_FractionInteger;
+        }
+        else
+        {
+            current->state = JSONNumberState_Exponent;
+        }
+    }
+    
+    if (current->state == JSONNumberState_FractionInteger)
+    {
+        while (gj_IsDigit(gjson_peek_current_char(json_parse_data)))
+        {
+            // TODO
+            gjson_feed_current_char(json_parse_data);
+            ReturnIfOutOfBytes();
+        }
+        current->state = JSONNumberState_Exponent;
+    }
+
+    if (current->state == JSONNumberState_Exponent)
+    {
+        if (gjson_peek_current_char(json_parse_data) == GJSON_EXPONENT_e ||
+            gjson_peek_current_char(json_parse_data) == GJSON_EXPONENT_E)
+        {
+            gj_Assert(0);
+            current->state = JSONNumberState_ExponentSign;
+        }
+        else
+        {
+            json_parse_queue_pop();
+            return;
+        }
+    }
+    
+    if (current->state == JSONNumberState_ExponentSign)
+    {
+        if (gjson_feed_current_char(json_parse_data) == GJSON_SIGN_NEGATIVE)
+        {
+            // TODO
+        }
+        current->state = JSONNumberState_ExponentInteger;
+    }
+    
+    if (current->state == JSONNumberState_ExponentInteger)
+    {
+        // TODO
+        gj_Assert(0);
     }    
 }
 
 static void gjson_parse_value(JSONParseData* json_parse_data)
 {
+    ReturnIfOutOfBytes();
     json_parse_queue_pop();
+    
     char current_char = gjson_peek_current_char(json_parse_data);
     switch (current_char)
     {
-        case GJSON_OBJECT_START: json_parse_queue_push(JSONStateType_Object, 0); break;
-        case GJSON_ARRAY_START:  json_parse_queue_push(JSONStateType_Array,  0); break;
-        case GJSON_STRING:       json_parse_queue_push(JSONStateType_String, 0); break;
+        case GJSON_OBJECT_START:
+        {
+            json_parse_queue_push(JSONStateType_Object);
+            gjson_parse_object(json_parse_data);
+        } break;
+        
+        case GJSON_ARRAY_START:
+        {
+            json_parse_queue_push(JSONStateType_Array);
+            gjson_parse_array(json_parse_data);
+        } break;
+        
+        case GJSON_STRING:
+        {
+            json_parse_queue_push(JSONStateType_String);
+            gjson_parse_string(json_parse_data);
+        } break;
+        
         default:
         {
             if (current_char == GJSON_SIGN_NEGATIVE || gj_IsDigit(current_char))
             {
-                json_parse_queue_push(JSONStateType_Number, 0);
+                json_parse_queue_push(JSONStateType_Number);
+                gjson_parse_number(json_parse_data);
             }
             else
             {
+                gj_Assert(0);
+#if 0
                 char* current_cursor = gjson_get_current_cursor(json_parse_data);
                 if (gj_strings_equal(current_cursor, GJSON_TRUE, gj_string_length(GJSON_TRUE)))
                 {
                     // TODO
-                    json_parse_queue_push(JSONStateType_MoveCursor, 4);
+                    json_parse_queue_push(JSONStateType_MoveCursor);
                 }
                 else if (gj_strings_equal(current_cursor, GJSON_FALSE, gj_string_length(GJSON_FALSE)))
                 {
                     // TODO
-                    json_parse_queue_push(JSONStateType_MoveCursor, 5);
+                    json_parse_queue_push(JSONStateType_MoveCursor);
                 }
                 else if (gj_strings_equal(current_cursor, GJSON_NULL, gj_string_length(GJSON_NULL)))
                 {
                     // TODO
-                    json_parse_queue_push(JSONStateType_MoveCursor, 4);
+                    json_parse_queue_push(JSONStateType_MoveCursor);
                 }
+#endif
             }
         } break;
     }
@@ -404,34 +571,34 @@ static size_t gj_parse_json(JSON* json, void* json_data, size_t size)
     size_t result = 0;
 
     JSONParseData json_parse_data;
-    json_parse_data.data        = (char*)json_data;
-    json_parse_data.size        = size;
-    json_parse_data.data_cursor = 0;
+    json_parse_data.data   = (char*)json_data;
+    json_parse_data.size   = size;
+    json_parse_data.cursor = 0;
 
     if (json_parse_queue.count == 0)
     {
-        json_parse_queue_push(JSONStateType_SkipWhitespace, 0);
-        json_parse_queue_push(JSONStateType_Value, 0);
-        json_parse_queue_push(JSONStateType_SkipWhitespace, 0);
+        json_parse_queue_push(JSONStateType_SkipWhitespace);
+        json_parse_queue_push(JSONStateType_Value);
+        json_parse_queue_push(JSONStateType_SkipWhitespace);
     }
 
-    while (!gjson_out_of_bytes(&json_parse_data))
+    while (!gjson_out_of_bytes(&json_parse_data) && json_parse_queue.count > 0)
     {
         JSONParseState* current = json_parse_queue_current();
         switch (current->type)
         {
-            case JSONStateType_SkipWhitespace: gjson_skip_whitespace(&json_parse_data);       break;
-            case JSONStateType_Value:          gjson_parse_value(&json_parse_data);           break;
-            case JSONStateType_MoveCursor:     gjson_move_cursor(&json_parse_data, current->n); break;
-            case JSONStateType_Object:         gjson_parse_object(&json_parse_data);          break;
-            case JSONStateType_Array:          gjson_parse_array(&json_parse_data);           break;
-            case JSONStateType_String:         gjson_parse_string(&json_parse_data);          break;
-            case JSONStateType_Number:         gjson_parse_number(&json_parse_data);          break;
+            case JSONStateType_SkipWhitespace: gjson_skip_whitespace(&json_parse_data); break;
+            case JSONStateType_Value:          gjson_parse_value(&json_parse_data);     break;
+            case JSONStateType_Object:         gjson_parse_object(&json_parse_data);    break;
+            case JSONStateType_Array:          gjson_parse_array(&json_parse_data);     break;
+            case JSONStateType_String:         gjson_parse_string(&json_parse_data);    break;
+            case JSONStateType_Number:         gjson_parse_number(&json_parse_data);    break;
                 
-            default: Assert(0); break;
+            default: gj_Assert(0); break;
         }
     }
-    result = json_parse_data.data_cursor;
+
+    result = json_parse_data.cursor;
     return result;
 }
 
