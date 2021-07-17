@@ -74,6 +74,7 @@ int mainCRTStartup()
         memcpy(json_file_name, buffer, BUFFER_SIZE);
         json_file_name[json_file_name_length] = '\0';
 
+        // TODO: Might be bigger than file
         size_t json_data_buffer_size = 1024 * 1024 * 64;
         if (*command_line == ' ')
         {
@@ -126,7 +127,7 @@ int mainCRTStartup()
             f32 total = ((f32)(end.QuadPart - start.QuadPart) /
                          (f32)perf_count_frequency.QuadPart);
             char total_message[BUFFER_SIZE];
-            int total_message_length = stbsp_sprintf(total_message, "Total time: %f (%f mb/s)\n", total, (json_file_handle.file_size / (1024*1024)) / total);
+            int total_message_length = stbsp_sprintf(total_message, "Total time: %lf (%f mb/s)\n", total, ((double)json_file_handle.file_size / (double)(1024*1024)) / total);
             printf(total_message, total_message_length);
         }
         
