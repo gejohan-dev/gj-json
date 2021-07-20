@@ -7,8 +7,9 @@
 #pragma comment(lib, "user32")
 
 static HANDLE stdout_handle;
-void printf(const char* s, const int length)
+void printf(const char* s)
 {
+    int length = 0; const char* _s = s; while (*_s++) { length++; }
     DWORD bytes_written;
     WriteConsoleA(stdout_handle, s, length, &bytes_written, NULL);
 }
@@ -20,7 +21,7 @@ void printf(const char* s, const int length)
         if (!(Exp)) {                                                   \
             char error_message[BUFFER_SIZE];                            \
             int error_message_length = stbsp_sprintf(error_message, "Error in %s:%d\n", __FILE__ , __LINE__); \
-            printf(error_message, error_message_length);                \
+            printf(error_message);                                      \
             LPVOID lpMsgBuf;                                            \
             LPVOID lpDisplayBuf;                                        \
             DWORD dw = GetLastError();                                  \
@@ -34,7 +35,7 @@ void printf(const char* s, const int length)
                 MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),              \
                 (LPTSTR) &lpMsgBuf,                                     \
                 0, NULL );                                              \
-            printf(lpMsgBuf, format_message_length);                    \
+            printf((const char*)lpMsgBuf);                              \
             __debugbreak();                                             \
         }                                                               \
     } while (0)
@@ -44,8 +45,16 @@ void printf(const char* s, const int length)
 
 #define GJ_BASE_MEMSET
 #include <gj/gj_base.h>
+#if !defined(__cplusplus)
+#pragma function(sqrtf)
+float sqrtf(float x) { return x; }
+#pragma function(tanf)
+float tanf(float x) { return x; }
+#endif
+#include <gj/gj_math.h>
 
 #include "json.h"
+#include "json_print.h"
 
 #include <gj/win32_platform.h>
 
@@ -74,40 +83,42 @@ int mainCRTStartup()
         memcpy(json_file_name, buffer, BUFFER_SIZE);
         json_file_name[json_file_name_length] = '\0';
 
+        win32_init_platform_api();    
+
+        PlatformFileHandle json_file_handle =
+            g_platform_api.get_file_handle(json_file_name, PlatformOpenFileModeFlags_Read);
+
         // TODO: Might be bigger than file
-        size_t json_data_buffer_size = 1024 * 1024 * 64;
+        size_t json_data_buffer_size = gj_Min(1024 * 1024 * 64, json_file_handle.file_size);
         if (*command_line == ' ')
         {
             while (*command_line == ' ') { *command_line++; }
             GJParseNumber buffer_size = gj_parse_number(command_line);
-            if (buffer_size.ok) json_data_buffer_size = buffer_size.number;
+            if (buffer_size.ok) json_data_buffer_size = gj_Min(buffer_size.number, json_file_handle.file_size);
         }
         
-        win32_init_platform_api();    
-
         stdout_handle = win32_get_stdout_handle();
         
         {
-            int read_file_message_length = stbsp_sprintf(buffer, "Reading [%s] with buffer size [%ld]...\n", json_file_name, json_data_buffer_size);
-            printf(buffer, read_file_message_length);
+            stbsp_sprintf(buffer, "Reading [%s] with buffer size [%ld]...\n", json_file_name, json_data_buffer_size);
+            printf(buffer);
         }
 
-        PlatformFileHandle json_file_handle =
-            g_platform_api.get_file_handle(json_file_name, PlatformOpenFileModeFlags_Read);
         size_t json_data_read_bytes  = 0;
         void* json_data = g_platform_api.allocate_memory(json_file_handle.file_size);
         g_platform_api.read_data_from_file_handle(json_file_handle, json_data_read_bytes, json_data_buffer_size, json_data);
     
         {
-            int read_file_message_length = stbsp_sprintf(buffer, "Size %lld...\n", json_file_handle.file_size / (1024*1024));
-            printf(buffer, read_file_message_length);
+            stbsp_sprintf(buffer, "Size %lf...\n", gj_BytesToMegabytes(json_file_handle.file_size));
+            printf(buffer);
         }
         
         LARGE_INTEGER start;
         QueryPerformanceCounter(&start);
-    
-        JSON json;
-        gj_ZeroMemory(&json);
+
+        size_t working_memory_size = Gigabytes(1);
+        void*  working_memory      = g_platform_api.allocate_memory(working_memory_size);
+        JSON json = gj_init_json(working_memory, working_memory_size);
         while (json_data_read_bytes < json_file_handle.file_size)
         {
             if (json_data_read_bytes + json_data_buffer_size > json_file_handle.file_size)
@@ -119,7 +130,7 @@ int mainCRTStartup()
             json_data_read_bytes += read_bytes;
         }
         gj_Assert(json_data_read_bytes == json_file_handle.file_size);
-    
+
         {
             LARGE_INTEGER end;
             QueryPerformanceCounter(&end);
@@ -127,16 +138,28 @@ int mainCRTStartup()
             f32 total = ((f32)(end.QuadPart - start.QuadPart) /
                          (f32)perf_count_frequency.QuadPart);
             char total_message[BUFFER_SIZE];
-            int total_message_length = stbsp_sprintf(total_message, "Total time: %lf (%f mb/s)\n", total, ((double)json_file_handle.file_size / (double)(1024*1024)) / total);
-            printf(total_message, total_message_length);
+            stbsp_sprintf(total_message, "Total time: %lf (%f mb/s)\n", total, gj_BytesToMegabytes(json_file_handle.file_size) / total);
+            printf(total_message);
         }
-        
+
+#if GJ_DEBUG
+        stbsp_sprintf(buffer, "object_total      = %lf (%lld)\n", gj_BytesToMegabytes(object_total), sizeof(JSONObject));
+        printf(buffer);
+        stbsp_sprintf(buffer, "array_total       = %lf (%lld)\n", gj_BytesToMegabytes(array_total), sizeof(JSONArray));
+        printf(buffer);
+        stbsp_sprintf(buffer, "string_total      = %lf (%lld)\n", gj_BytesToMegabytes(string_total), sizeof(JSONString));
+        printf(buffer);
+        stbsp_sprintf(buffer, "string_copy_total = %lf\n", gj_BytesToMegabytes(string_copy_total));
+        printf(buffer);
+#endif
+        gjson_find(json, "login", "clue");
+
         g_platform_api.close_file_handle(json_file_handle);
         g_platform_api.deallocate_memory(json_data);
 
         {
             char read_file_message[] = "Done!\n";
-            printf(read_file_message, 6);
+            printf(read_file_message);
         }
     
         result = 0;
@@ -177,4 +200,6 @@ void *memcpy(void* _dst, void const* _src, size_t size)
     }
     return _dst;
 }
+
+/* #pragma function(sqrt) */
 #endif
