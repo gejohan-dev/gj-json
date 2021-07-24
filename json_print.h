@@ -3,6 +3,7 @@
 
 #include "json.h"
 
+#if 0
 extern void printf(const char* s);
 
 //////////////////////////////////////////////////////////////////////
@@ -114,5 +115,6 @@ void gjson_find(JSON json, const char* key, const char* value)
 {
     json_find_node(&json.root, key, value);
 }
+#endif
 
 #endif
